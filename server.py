@@ -1,4 +1,5 @@
 from typing import Optional
+from pickle import UnpicklingError
 
 from abci import (
     ABCIServer,
@@ -12,7 +13,7 @@ from abci import (
     CodeTypeOk,
 )
 
-from core import decode, Status, encode, TossPotato
+from core import decode, Status, encode, TossPotato, Message
 
 
 BLOW_UP_INC = 100
@@ -20,6 +21,7 @@ BLOW_UP_INC = 100
 
 class SimpleCounter(BaseApplication):
     def __init__(self):
+        self.sequence = 0
         self.players = tuple()
         self.secrets = tuple()
         self.potato_holder = None
@@ -71,15 +73,14 @@ class SimpleCounter(BaseApplication):
             return 'Invalid signature'
 
     def check_tx(self, tx) -> ResponseCheckTx:
-        value = decode(tx)
-        check = self.check_toss(value)
-        if check is not None:
-            return ResponseCheckTx(code=1, info=check)
-        else:
-            return ResponseCheckTx(code=CodeTypeOk)
+        try:
+            decode(tx)
+        except (TypeError, UnpicklingError):
+            return ResponseCheckTx(code=1)
+        return ResponseCheckTx(code=CodeTypeOk)
 
     def deliver_tx(self, tx) -> ResponseDeliverTx:
-        value = decode(tx)
+        value = decode(tx).data
         check = self.check_toss(value)
         if check is not None:
             return ResponseDeliverTx(code=1, info=check)
@@ -88,7 +89,7 @@ class SimpleCounter(BaseApplication):
         return ResponseDeliverTx(code=CodeTypeOk)
 
     def query(self, req) -> ResponseQuery:
-        v = encode(self.status())
+        v = self.encoded_status()
         return ResponseQuery(code=CodeTypeOk, value=v, height=self.last_block_height)
 
     def end_block(self, req) -> ResponseEndBlock:
@@ -102,7 +103,12 @@ class SimpleCounter(BaseApplication):
         return ResponseEndBlock()
 
     def commit(self) -> ResponseCommit:
-        return ResponseCommit(data=encode(self.status()))
+        return ResponseCommit(data=self.encoded_status())
+
+    def encoded_status(self):
+        res = encode(Message(self.status(), self.sequence))
+        self.sequence += 1
+        return res
 
 
 if __name__ == '__main__':
