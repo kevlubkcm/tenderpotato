@@ -1,11 +1,11 @@
-from typing import Optional
+import abc
+from typing import Tuple, Dict, List
 from pickle import UnpicklingError
 
 from abci import (
     ABCIServer,
     BaseApplication,
     ResponseInfo,
-    ResponseInitChain,
     ResponseCheckTx, ResponseDeliverTx,
     ResponseQuery,
     ResponseCommit,
@@ -13,28 +13,103 @@ from abci import (
     CodeTypeOk,
 )
 
-from core import decode, Status, encode, TossPotato, Message
+from core import (
+    decode, State, encode_for_wire, TossPotato, Message, SignatureError, NewPlayer, RawMessage, sign_message,
+    create_key_pair, state_hash
+)
 
 
-BLOW_UP_INC = 100
+class EndBlockHandler(abc.ABC):
+    @abc.abstractmethod
+    def end_block(self, state: State, req) -> Tuple[State, ResponseEndBlock]:
+        pass
 
 
-class SimpleCounter(BaseApplication):
+class FixedBlowUp(EndBlockHandler):
+    def __init__(self, blow_up_inc: int):
+        self.blow_up_inc = blow_up_inc
+
+    def end_block(self, state: State, req) -> Tuple[State, ResponseEndBlock]:
+        if req.height == state.blow_up_height:
+            losses = list(state.losses)
+            losses[state.potato_holder] += 1
+            losses = tuple(losses)
+            blowup = state.blow_up_height + self.blow_up_inc
+        elif state.blow_up_height is not None and state.blow_up_height < 0:  # New game
+            losses = state.losses
+            blowup = state.last_block_height + self.blow_up_inc
+        else:
+            losses = state.losses
+            blowup = state.blow_up_height
+
+        return State(state.players, losses, state.potato_holder, blowup, req.height), ResponseEndBlock()
+
+
+class MessageHandler(abc.ABC):
+    def __init__(self, message_type: type):
+        self.message_type = message_type
+
+    @abc.abstractmethod
+    def deliver_tx(self, state: State, message: Message) -> Tuple[State, ResponseDeliverTx]:
+        pass
+
+
+class TossPotatoHandler(MessageHandler):
     def __init__(self):
+        super().__init__(TossPotato)
+
+    def deliver_tx(self, state: State, message: Message) -> Tuple[State, ResponseDeliverTx]:
+        assert type(message.data) is TossPotato
+
+        if message.sender != state.players[state.potato_holder]:
+            return state, ResponseDeliverTx(code=1, info='Not holding the potato')
+
+        if message.data.receiver not in state.players:
+            return state, ResponseDeliverTx(code=1, info='Target player does not exist')
+
+        idx = state.players.index(message.data.receiver)
+        return State(
+            state.players,
+            state.losses,
+            idx,
+            state.blow_up_height,
+            state.last_block_height
+        ), ResponseDeliverTx(code=0)
+
+
+class NewPlayerHandler(MessageHandler):
+    def __init__(self):
+        super().__init__(NewPlayer)
+
+    def deliver_tx(self, state: State, message: Message) -> Tuple[State, ResponseDeliverTx]:
+        if message.sender in state.players:
+            return state, ResponseDeliverTx(code=1, info='Already playing')
+
+        if len(state.players) == 1:  # We have enough players to start
+            blowup = -1
+            holder = 1
+        else:
+            blowup = state.blow_up_height
+            holder = state.potato_holder
+
+        return State(
+            state.players + (message.sender, ),
+            state.losses + (0, ),
+            holder,
+            blowup,
+            state.last_block_height,
+        ), ResponseDeliverTx(code=0)
+
+
+class TenderPotato(BaseApplication):
+    def __init__(self, handlers: List[MessageHandler], end_block: EndBlockHandler):
         self.sequence = 0
-        self.players = tuple()
-        self.secrets = tuple()
-        self.potato_holder = None
-        self.blow_up_height = None
-        self.losses = tuple()
-        self.last_block_height = 0
+        self.private_key, self.public_key = create_key_pair()
 
-    def __index_of(self, player):
-        if player in self.players:
-            return self.players.index(player)
+        self.state = State(tuple(), tuple(), None, None, 0)
 
-    def status(self):
-        return Status(self.players, self.losses, self.players[self.potato_holder])
+        self.handlers: Dict[type, MessageHandler] = {h.message_type: h for h in handlers}
+        self.end_block_handler = end_block
 
     def info(self, req) -> ResponseInfo:
         r = ResponseInfo()
@@ -43,76 +118,45 @@ class SimpleCounter(BaseApplication):
         r.last_block_app_hash = b''
         return r
 
-    def init_chain(self, req) -> ResponseInitChain:
-        """Set initial state on first run"""
-        self.players = ('a', 'b', 'c')
-        self.secrets = ('aa', 'bb', 'cc')
-        assert len(self.players) == len(self.secrets)
-
-        self.losses = (0, ) * len(self.players)
-        self.potato_holder = 0
-        self.blow_up_height = BLOW_UP_INC
-        self.last_block_height = 0
-        return ResponseInitChain()
-
-    def check_toss(self, value: TossPotato) -> Optional[str]:
-        if value.sender == value.receiver:
-            return 'Cannot send to self'
-
-        sender_index = self.__index_of(value.sender)
-        if sender_index is None:
-            return 'Sender does not exist'
-
-        if sender_index != self.potato_holder:
-            return 'Sender does not hold the potato'
-
-        if self.__index_of(value.receiver) is None:
-            return 'Receiver does not exist'
-
-        if value.secret != self.secrets[self.potato_holder]:
-            return 'Invalid signature'
-
-    def check_tx(self, tx) -> ResponseCheckTx:
+    def check_tx(self, tx: bytes) -> ResponseCheckTx:
         try:
-            decode(tx)
-        except (TypeError, UnpicklingError):
-            return ResponseCheckTx(code=1)
-        return ResponseCheckTx(code=CodeTypeOk)
+            message = decode(tx)
+        except (SignatureError, TypeError, UnpicklingError) as e:
+            return ResponseCheckTx(code=1, info='%s' % type(e))
 
-    def deliver_tx(self, tx) -> ResponseDeliverTx:
-        value = decode(tx).data
-        check = self.check_toss(value)
-        if check is not None:
-            return ResponseDeliverTx(code=1, info=check)
+        message_type = type(message.data)
+        handler = self.handlers.get(message_type)
+        if handler is None:
+            return ResponseCheckTx(code=1, info='Unrecognized Type: %s' % message_type)
 
-        self.potato_holder = self.__index_of(value.receiver)
-        return ResponseDeliverTx(code=CodeTypeOk)
+        return ResponseCheckTx(code=0)
+
+    def deliver_tx(self, tx: bytes) -> ResponseDeliverTx:
+        message = decode(tx)
+        self.state, resp = self.handlers[type(message.data)].deliver_tx(self.state, message)
+        return resp
 
     def query(self, req) -> ResponseQuery:
-        v = self.encoded_status()
-        return ResponseQuery(code=CodeTypeOk, value=v, height=self.last_block_height)
+        message = sign_message(RawMessage(self.public_key, self.state, self.sequence), self.private_key)
+        res = encode_for_wire(message)
+        self.sequence += 1
+        return ResponseQuery(code=CodeTypeOk, value=res, height=self.state.last_block_height)
 
     def end_block(self, req) -> ResponseEndBlock:
-        if req.height == self.blow_up_height:
-            self.blow_up_height += BLOW_UP_INC
-            losses = list(self.losses)
-            losses[self.potato_holder] += 1
-            self.losses = tuple(losses)
-
-        self.last_block_height = req.height
-        return ResponseEndBlock()
+        self.state, resp = self.end_block_handler.end_block(self.state, req)
+        return resp
 
     def commit(self) -> ResponseCommit:
-        return ResponseCommit(data=self.encoded_status())
-
-    def encoded_status(self):
-        res = encode(Message(self.status(), self.sequence))
-        self.sequence += 1
-        return res
+        return ResponseCommit(data=state_hash(self.state))
 
 
 if __name__ == '__main__':
-    # Create the app
-    app = ABCIServer(app=SimpleCounter())
-    # Run it
+    tp = TenderPotato(
+        [
+            NewPlayerHandler(),
+            TossPotatoHandler(),
+        ],
+        FixedBlowUp(100),
+    )
+    app = ABCIServer(app=tp)
     app.run()
