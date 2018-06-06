@@ -16,14 +16,15 @@ class BroadcastMode(Enum):
 
 
 class Client:
-    def __init__(self):
+    def __init__(self, server=URL):
         self.sequence = 0
         self.private_key, self.public_key = create_key_pair()
+        self.server = server
 
     def send_message(self, msg, mode: BroadcastMode) -> dict:
         raw_msg = RawMessage(self.public_key, msg, self.sequence)
         msg = sign_message(raw_msg, self.private_key)
-        r = requests.get('%s/%s?tx=0x%s' % (URL, mode.value, encode_for_wire(msg).hex()))
+        r = requests.get('%s/%s?tx=0x%s' % (self.server, mode.value, encode_for_wire(msg).hex()))
         self.sequence += 1
         return r.json()
 
